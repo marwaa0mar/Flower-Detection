@@ -7,6 +7,7 @@ import numpy as np
 import torch.nn as nn
 from torchvision.models import mobilenet_v2
 from torchvision import transforms
+from xgboost import XGBClassifier
 
 class FeedForwardMLP(nn.Module):
     def __init__(self, input_dim, num_classes):
@@ -25,38 +26,24 @@ class FeedForwardMLP(nn.Module):
         return self.fc(x)
 
 def preprocess_image(img):
-    # Resize
     img_resized = cv2.resize(img, (256, 256))
-    
-    # Normalize
     img_norm = img_resized / 255.0
-    
-    # Denoise
     img_denoised = cv2.GaussianBlur(img_norm, (3, 3), 0)
-    img_denoised = (img_denoised * 255).astype(np.uint8)  # Convert back to 8-bit
-    
-    # CLAHE (on LAB lightness)
+    img_denoised = (img_denoised * 255).astype(np.uint8)
     lab = cv2.cvtColor(img_denoised, cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(lab)
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     l_clahe = clahe.apply(l)
     lab_clahe = cv2.merge((l_clahe, a, b))
     img_clahe = cv2.cvtColor(lab_clahe, cv2.COLOR_LAB2BGR)
-
-    # Grayscale for intensity-based processing
     gray_scaled = cv2.cvtColor(img_clahe, cv2.COLOR_BGR2GRAY)
-
-    # Blurring + Sharpening
     sharpen_kernel = np.array([[0, -0.5, 0],
                                [-0.5, 3, -0.5],
                                [0, -0.5, 0]], dtype=np.float32)
     blurred = cv2.GaussianBlur(gray_scaled, (3, 3), 0)
     sharpened = cv2.filter2D(blurred, -1, sharpen_kernel)
-
-    # Morphological closing
     kernel = np.ones((3, 3), np.uint8)
     morph_clean = cv2.morphologyEx(sharpened, cv2.MORPH_CLOSE, kernel)
-
     return img_clahe, morph_clean
 
 # ==== GUI Class ====
@@ -65,9 +52,13 @@ class ObjectDetectionGUI:
         self.feature_extractor = mobilenet_v2(pretrained=True).features
         self.feature_extractor.eval()
         self.model = FeedForwardMLP(1280, 5)
-        state_dict = torch.load("D:\Downloads\FeedForwardMLP_epoch_14.pth", map_location=torch.device('cpu'))
+        state_dict = torch.load("D:/Downloads/FeedForwardMLP_epoch_14.pth", map_location=torch.device('cpu'))
         self.model.load_state_dict(state_dict)
         self.model.eval()
+
+        self.xgb_model = XGBClassifier()
+        self.xgb_model.load_model("D:/Downloads/xgb_classifier_model.json")
+
         self.class_names = ['Rose', 'Tulip', 'Daisy', 'Sunflower', 'Dandelion']
 
         self.root = root
@@ -79,6 +70,14 @@ class ObjectDetectionGUI:
 
         self.instructions = tk.Label(self.main_frame, text="Upload an image and click 'Detect Objects' to start.", font=('Arial', 12))
         self.instructions.pack(pady=5)
+
+        # Model selection
+        self.model_choice = tk.StringVar(value="MLP")
+        self.model_selector_frame = tk.Frame(self.main_frame)
+        self.model_selector_frame.pack(pady=5)
+        tk.Label(self.model_selector_frame, text="Choose model:").pack(side=tk.LEFT)
+        tk.Radiobutton(self.model_selector_frame, text="MLP", variable=self.model_choice, value="MLP").pack(side=tk.LEFT)
+        tk.Radiobutton(self.model_selector_frame, text="XGBoost", variable=self.model_choice, value="XGB").pack(side=tk.LEFT)
 
         self.button_frame = tk.Frame(self.main_frame)
         self.button_frame.pack(pady=10)
@@ -132,29 +131,36 @@ class ObjectDetectionGUI:
             transforms.Resize((224, 224)),
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                std=[0.229, 0.224, 0.225])
+                                 std=[0.229, 0.224, 0.225])
         ])
 
-        input_image = transform(self.cv_image).unsqueeze(0)  # [1, 3, 224, 224]
+        input_image = transform(self.cv_image).unsqueeze(0)
 
         with torch.no_grad():
-            features = self.feature_extractor(input_image)              # [1, 1280, 7, 7]
-            features = torch.nn.functional.adaptive_avg_pool2d(features, 1).view(1, -1)  # [1, 1280]
+            features = self.feature_extractor(input_image)
+            features = torch.nn.functional.adaptive_avg_pool2d(features, 1).view(1, -1)
 
-            outputs = self.model(features)
-            probs = torch.nn.functional.softmax(outputs, dim=1)
+            if self.model_choice.get() == "MLP":
+                outputs = self.model(features)
+                probs = torch.nn.functional.softmax(outputs, dim=1)
+            else:  # XGBoost
+                np_features = features.numpy()
+                probs_np = self.xgb_model.predict_proba(np_features)
+                probs = torch.tensor(probs_np)
+
             score, pred = torch.max(probs, 1)
             score = score.item()
             class_idx = pred.item()
+
             if score >= 0.8:
                 label = self.class_names[class_idx]
-                x1, y1, x2, y2 = 100, 100, 300, 300  # dummy bbox
+                x1, y1, x2, y2 = 100, 100, 300, 300  # Dummy box
                 results = [(x1, y1, x2, y2, label, score, class_idx)]
                 self._draw_results(results)
             else:
                 self.result_label.config(
                     text=f"Detection Results:\nNo confident prediction (score < 0.80).\n"
-                        f"Predicted Class Index: {class_idx}, Score: {score:.2f}"
+                         f"Predicted Class Index: {class_idx}, Score: {score:.2f}"
                 )
                 self.status.config(text="Detection complete (no high-confidence class).")
 
