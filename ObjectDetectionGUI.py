@@ -7,7 +7,30 @@ import numpy as np
 import torch.nn as nn
 from torchvision.models import mobilenet_v2
 from torchvision import transforms
-from xgboost import XGBClassifier
+
+def apply_canny_and_draw_boxes(img, min_area=1000):
+    # Ensure grayscale
+    if len(img.shape) == 3 and img.shape[2] == 3:
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = img
+
+    # Canny + morphology
+    edges = cv2.Canny(gray, 50, 150)
+    kernel = np.ones((3, 3), np.uint8)
+    edges_dilated = cv2.dilate(edges, kernel, iterations=1)
+
+    # Find contours
+    contours, _ = cv2.findContours(edges_dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    boxes = []
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area >= min_area:
+            x, y, w, h = cv2.boundingRect(cnt)
+            boxes.append((x, y, x + w, y + h))  # format: (x1, y1, x2, y2)
+
+    return boxes
 
 class FeedForwardMLP(nn.Module):
     def __init__(self, input_dim, num_classes):
@@ -56,9 +79,6 @@ class ObjectDetectionGUI:
         self.model.load_state_dict(state_dict)
         self.model.eval()
 
-        self.xgb_model = XGBClassifier()
-        self.xgb_model.load_model("D:/Downloads/xgb_classifier_model.json")
-
         self.class_names = ['Rose', 'Tulip', 'Daisy', 'Sunflower', 'Dandelion']
 
         self.root = root
@@ -70,14 +90,6 @@ class ObjectDetectionGUI:
 
         self.instructions = tk.Label(self.main_frame, text="Upload an image and click 'Detect Objects' to start.", font=('Arial', 12))
         self.instructions.pack(pady=5)
-
-        # Model selection
-        self.model_choice = tk.StringVar(value="MLP")
-        self.model_selector_frame = tk.Frame(self.main_frame)
-        self.model_selector_frame.pack(pady=5)
-        tk.Label(self.model_selector_frame, text="Choose model:").pack(side=tk.LEFT)
-        tk.Radiobutton(self.model_selector_frame, text="MLP", variable=self.model_choice, value="MLP").pack(side=tk.LEFT)
-        tk.Radiobutton(self.model_selector_frame, text="XGBoost", variable=self.model_choice, value="XGB").pack(side=tk.LEFT)
 
         self.button_frame = tk.Frame(self.main_frame)
         self.button_frame.pack(pady=10)
@@ -131,7 +143,7 @@ class ObjectDetectionGUI:
             transforms.Resize((224, 224)),
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                 std=[0.229, 0.224, 0.225])
+                                std=[0.229, 0.224, 0.225])
         ])
 
         input_image = transform(self.cv_image).unsqueeze(0)
@@ -139,29 +151,30 @@ class ObjectDetectionGUI:
         with torch.no_grad():
             features = self.feature_extractor(input_image)
             features = torch.nn.functional.adaptive_avg_pool2d(features, 1).view(1, -1)
-
-            if self.model_choice.get() == "MLP":
-                outputs = self.model(features)
-                probs = torch.nn.functional.softmax(outputs, dim=1)
-            else:  # XGBoost
-                np_features = features.numpy()
-                probs_np = self.xgb_model.predict_proba(np_features)
-                probs = torch.tensor(probs_np)
+            outputs = self.model(features)
+            probs = torch.nn.functional.softmax(outputs, dim=1)
 
             score, pred = torch.max(probs, 1)
             score = score.item()
             class_idx = pred.item()
 
-            if score >= 0.8:
+            if score >= 0.7:
                 label = self.class_names[class_idx]
-                x1, y1, x2, y2 = 100, 100, 300, 300  # Dummy box
-                results = [(x1, y1, x2, y2, label, score, class_idx)]
-                self._draw_results(results)
+
+                boxes = apply_canny_and_draw_boxes(self.cv_image)
+
+                results = [(x1, y1, x2, y2, label, score, class_idx) for (x1, y1, x2, y2) in boxes]
+
+                if results:
+                    self._draw_results(results)
+                else:
+                    self.result_label.config(
+                        text=f"Detection Results:\n{label} detected with high confidence, but no object boundaries found.")
+                    self.status.config(text="Detection complete (no contours found).")
             else:
                 self.result_label.config(
                     text=f"Detection Results:\nNo confident prediction (score < 0.80).\n"
-                         f"Predicted Class Index: {class_idx}, Score: {score:.2f}"
-                )
+                        f"Predicted Class Index: {class_idx}, Score: {score:.2f}")
                 self.status.config(text="Detection complete (no high-confidence class).")
 
     def _draw_results(self, results):
@@ -180,7 +193,6 @@ class ObjectDetectionGUI:
         self.result_label.config(text=results_text)
         self.status.config(text="Detection complete.")
 
-# ==== Main Entry Point ====
 if __name__ == "__main__":
     root = tk.Tk()
     app = ObjectDetectionGUI(root)
